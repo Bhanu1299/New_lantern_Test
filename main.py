@@ -1,15 +1,18 @@
+import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
+from groq import Groq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Radiology Prior Relevance Classifier")
 
-# In-memory cache keyed by (current_study_id, prior_study_id)
+_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 _cache: dict[tuple[str, str], bool] = {}
 
 MODALITIES = {"MRI", "CT", "XR", "US", "PET", "NM", "XRAY"}
@@ -18,6 +21,14 @@ STOP_WORDS = {
     "LATERAL", "AP", "PA", "CONTRAST", "VIEWS", "VIEW",
     "STROKE", "SCREENING", "DIAGNOSTIC", "ROUTINE", "SERIES",
 }
+
+_SYSTEM = (
+    "You are a radiologist assistant. Given a current examination and a list of prior "
+    "examinations for the same patient, decide which priors are relevant for the radiologist "
+    "to review. A prior is relevant if it shows the same or related anatomy with the same or "
+    'related modality. Return ONLY valid JSON, no markdown, no explanation: '
+    '{"predictions": [{"study_id": "...", "is_relevant": true}]}'
+)
 
 
 # --- Pydantic models ---
@@ -53,7 +64,7 @@ class PredictResponse(BaseModel):
     predictions: list[Prediction]
 
 
-# --- Parsing helpers ---
+# --- Heuristic fallback ---
 
 def parse_modality_and_body(description: str) -> tuple[Optional[str], Optional[str]]:
     tokens = description.upper().split()
@@ -64,7 +75,6 @@ def parse_modality_and_body(description: str) -> tuple[Optional[str], Optional[s
         clean = token.rstrip(",;:")
         if clean in MODALITIES:
             modality = clean
-            # Collect body part tokens after modality until a stop word
             for j in range(i + 1, len(tokens)):
                 word = tokens[j].rstrip(",;:")
                 if word in STOP_WORDS or word in MODALITIES:
@@ -88,6 +98,66 @@ def is_relevant(current: StudyInfo, prior: StudyInfo) -> bool:
     return cur_modality == pri_modality and cur_body == pri_body
 
 
+# --- Groq classification ---
+
+def _groq_classify(current: StudyInfo, priors: list[StudyInfo]) -> dict[str, bool]:
+    """One batched Groq call for all priors of a single current study."""
+    priors_text = "\n".join(
+        f"  - study_id={p.study_id}  desc={p.study_description}"
+        for p in priors
+    )
+    user_msg = (
+        f"Current examination: {current.study_description}\n\n"
+        f"Prior examinations:\n{priors_text}"
+    )
+
+    completion = _client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    raw = completion.choices[0].message.content or ""
+    data = json.loads(raw)
+    return {item["study_id"]: item["is_relevant"] for item in data["predictions"]}
+
+
+def _classify_case(case: CaseInput) -> list[Prediction]:
+    results: dict[str, bool] = {}
+    uncached: list[StudyInfo] = []
+
+    for prior in case.prior_studies:
+        key = (case.current_study.study_id, prior.study_id)
+        if key in _cache:
+            results[prior.study_id] = _cache[key]
+        else:
+            uncached.append(prior)
+
+    if uncached:
+        try:
+            llm_results = _groq_classify(case.current_study, uncached)
+            for prior in uncached:
+                val = llm_results.get(prior.study_id, is_relevant(case.current_study, prior))
+                _cache[(case.current_study.study_id, prior.study_id)] = val
+                results[prior.study_id] = val
+        except Exception as exc:
+            logger.warning("Groq call failed (%s), falling back to heuristics", exc)
+            for prior in uncached:
+                val = is_relevant(case.current_study, prior)
+                _cache[(case.current_study.study_id, prior.study_id)] = val
+                results[prior.study_id] = val
+
+    return [
+        Prediction(
+            case_id=case.case_id,
+            study_id=prior.study_id,
+            predicted_is_relevant=results[prior.study_id],
+        )
+        for prior in case.prior_studies
+    ]
+
+
 # --- Endpoints ---
 
 @app.get("/health")
@@ -104,24 +174,7 @@ def predict(request: PredictRequest):
         len(request.cases),
         total_priors,
     )
-
     predictions: list[Prediction] = []
-
     for case in request.cases:
-        for prior in case.prior_studies:
-            cache_key = (case.current_study.study_id, prior.study_id)
-            if cache_key in _cache:
-                result = _cache[cache_key]
-            else:
-                result = is_relevant(case.current_study, prior)
-                _cache[cache_key] = result
-
-            predictions.append(
-                Prediction(
-                    case_id=case.case_id,
-                    study_id=prior.study_id,
-                    predicted_is_relevant=result,
-                )
-            )
-
+        predictions.extend(_classify_case(case))
     return PredictResponse(predictions=predictions)
