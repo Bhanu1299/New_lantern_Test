@@ -72,59 +72,36 @@ BODY_SYNONYMS: dict[str, str] = {
 }
 
 _SYSTEM = (
-    "You are an expert radiologist assistant. Given a current examination and a list of prior "
-    "examinations for the same patient, determine which priors are RELEVANT for the radiologist to review.\n\n"
-    "A prior is RELEVANT if it shows the same or related anatomy with the same or related imaging modality.\n\n"
-    "MODALITY RELEVANCE RULES:\n"
-    "- Same modality = relevant (MRI↔MRI, CT↔CT, etc.)\n"
-    "- CT ↔ X-ray (XR/CXR/KUB/CHEST): relevant when same body area\n"
-    "- MRI ↔ CT: relevant when same body area\n"
-    "- Ultrasound (US/Sono) ↔ CT: relevant when same body area\n"
-    "- MRI ↔ Ultrasound: relevant when same body area\n"
-    "- Nuclear Medicine (NM/SPECT/bone scan) ↔ CT: relevant when same body area\n"
-    "- PET ↔ CT or NM: relevant when same body area\n"
-    "- Mammography (MAM/MAMMO/Mammogram): ONLY relevant to other breast/mammography studies\n"
-    "- Echo (ECHO/Echocardiogram) ↔ cardiac CT, cardiac MRI, cardiac NM (MUGA/stress): relevant\n"
-    "- Different body areas = NOT relevant regardless of modality\n\n"
-    "BODY REGION EQUIVALENCES:\n"
-    "- Head = Brain = Cranial = Neuro = Intracranial\n"
-    "- Chest = Thorax = Thoracic = Pulmonary = Lungs = CXR\n"
-    "- Abdomen = Abdominal = Abd\n"
-    "- Abdomen and Abdomen/Pelvis = overlapping (relevant to each other)\n"
-    "- Pelvis = Pelvic\n"
-    "- Spine subtypes overlap: cervical / thoracic / lumbar / lumbosacral / LS spine\n"
-    "- Heart = Cardiac = Cardio = Myocardium = Myocardial = MUGA\n"
+    "You are an expert radiologist assistant. Identify which prior radiology exams are relevant "
+    "for comparison when reading a new study.\n\n"
+    "CRITICAL: When uncertain, ALWAYS mark as relevant. Missing a relevant comparison is far more "
+    "harmful than including an extra one. Bias strongly toward is_relevant=true.\n\n"
+    "A prior is RELEVANT if it images the same or overlapping body region with the same or "
+    "related modality. Be GENEROUS with relevance — err on the side of inclusion.\n\n"
+    "MODALITY PAIRS (relevant to each other when same/overlapping body area):\n"
+    "- CT ↔ X-ray (XR, CXR, plain film, KUB, CHEST alone)\n"
+    "- MRI ↔ CT\n"
+    "- Ultrasound (US, sono) ↔ CT or MRI\n"
+    "- Nuclear Medicine (NM, SPECT, bone scan, MUGA) ↔ CT\n"
+    "- PET ↔ CT or NM\n"
+    "- Echo (ECHO, echocardiogram) ↔ cardiac CT, cardiac MRI, cardiac NM\n"
+    "- Mammography (MAM, MAMMO, mammogram) ↔ ONLY other breast/mammography\n\n"
+    "BODY REGION SYNONYMS:\n"
+    "- Head = Brain = Cranial = Neuro\n"
+    "- Chest = Thorax = Thoracic = Pulmonary = Lungs\n"
+    "- Abdomen = Abd ≈ Abdomen/Pelvis (overlapping — mark relevant)\n"
+    "- Spine levels overlap (cervical/thoracic/lumbar/lumbosacral)\n"
+    "- Heart = Cardiac = Myocardium = MUGA\n"
     "- Kidney = Renal\n\n"
-    "MODALITY RECOGNITION:\n"
-    "- 'CHEST' alone (without MRI/CT/US qualifier) = Chest X-ray\n"
-    "- 'BONE SCAN' or 'BONE SPECT' = Nuclear Medicine (NM)\n"
-    "- 'MAM', 'MAMMO', 'MAMMOGRAPHY', 'MAMMOGRAM' = Mammography\n"
-    "- 'ECHO', 'ECHOCARDIOGRAM' = Cardiac Ultrasound\n"
-    "- 'PET/CT' = PET scan\n\n"
+    "MODALITY CLUES:\n"
+    "- 'CHEST' alone = chest X-ray\n"
+    "- 'BONE SCAN' / 'BONE SPECT' = NM\n"
+    "- 'ECHO' / 'ECHOCARDIOGRAM' = cardiac US\n"
+    "- 'PET/CT' = PET\n\n"
+    "You MUST include every prior study_id in your response.\n"
     "Return ONLY valid JSON, no markdown, no explanation:\n"
     '{"predictions": [{"study_id": "...", "is_relevant": true}]}'
 )
-
-_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "predictions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "study_id": {"type": "string"},
-                    "is_relevant": {"type": "boolean"},
-                },
-                "required": ["study_id", "is_relevant"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["predictions"],
-    "additionalProperties": False,
-}
-
 
 # --- Pydantic models ---
 
@@ -249,8 +226,7 @@ def _anthropic_classify(current: StudyInfo, priors: list[StudyInfo]) -> dict[str
 
     response = _client.messages.create(
         model="claude-opus-4-7",
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
+        max_tokens=8192,
         system=[
             {
                 "type": "text",
@@ -258,10 +234,7 @@ def _anthropic_classify(current: StudyInfo, priors: list[StudyInfo]) -> dict[str
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        output_config={
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": _SCHEMA},
-        },
+        output_config={"effort": "high"},
         messages=[{"role": "user", "content": user_msg}],
     )
 
