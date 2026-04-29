@@ -1,6 +1,6 @@
 # Radiology Prior Relevance Classifier
 
-A FastAPI service that classifies which prior radiology studies are relevant for comparison when reading a new exam. Achieves **97% accuracy** on the competition evaluation dataset.
+A FastAPI service that classifies which prior radiology studies are relevant for comparison when reading a new exam. Achieves **94.16% accuracy** on the private held-out evaluation set (top performance band).
 
 ## How It Works
 
@@ -158,7 +158,7 @@ POST /predict
 
 | Metric | Score |
 |---|---|
-| Competition accuracy | **97%** |
+| Competition accuracy (private split) | **94.16%** |
 | Heuristic-only accuracy | 93.9% |
 | Heuristic precision | 91.9% |
 | Heuristic recall | 81.4% |
